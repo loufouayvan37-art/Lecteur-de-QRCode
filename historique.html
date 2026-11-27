@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Historique des QR codes</title>
+  <link rel="stylesheet" href="style.css">
+  <style>
+    .page nav{
+      text-align: center;
+    }
+    .page nav a{
+      text-decoration: wavy;
+      font-family: Verdana, Geneva, Tahoma, sans-serif;
+      text-transform: inherit;
+      color: rgb(5, 5, 151);
+      margin: 10px;
+     /* background-color: rgb(6, 6, 238);*/
+      /*height: 15px;
+      width: 25px;*/
+      font-size: 20px;
+
+    }
+    h1{
+      background-color: rgb(5, 5, 151);
+      text-align: center; 
+      color: aliceblue;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif;
+      font-size: 32px;
+      border-radius: 15px;
+      height: 50px;
+
+    }
+    p{
+      text-align: center;
+    }
+    .connexion { max-width: 380px; margin: 24px auto; display: grid; gap: 10px; }
+    .connexion[hidden], #contenu-page[hidden] { display: none; }
+    .connexion input {
+      font: inherit; padding: 10px 12px; border-radius: var(--rayon);
+      border: 1px solid var(--trait); background: var(--surface); color: var(--encre);
+    }
+    .erreur-texte { color: var(--danger); margin: 0; min-height: 1.5em; }
+    .poste { color: var(--encre-douce); font-size: .85rem; margin-left: 8px; }
+    .barre-compte { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 12px; color: var(--encre-douce); font-size: .9rem; }
+    .barre-compte button { padding: 4px 10px; font-size: .85rem; }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <h1>Historique des Scans</h1>
+
+    <nav>
+      <a href="index.html">Scanner</a>
+      <a href="historique.html" aria-current="page">Historique</a>
+    </nav>
+
+    
+    <p class="sous-titre" id="sous-titre">Les QR codes lus, du plus récent au plus ancien.</p>
+
+    <form class="connexion" id="connexion" hidden>
+      <label for="email">Adresse e-mail</label>
+      <input id="email" type="email" autocomplete="username" required>
+      <label for="mdp">Mot de passe</label>
+      <input id="mdp" type="password" autocomplete="current-password" required>
+      <p class="erreur-texte" id="erreur" role="alert"></p>
+      <button type="submit" class="principal">Se connecter</button>
+    </form>
+
+    <div id="contenu-page" hidden>
+      <div class="barre-compte" id="barre-compte" hidden>
+        <span id="connecte-comme"></span>
+        <button type="button" id="btn-deconnexion">Se déconnecter</button>
+      </div>
+
+      <div class="outils">
+        <input id="recherche" type="search" placeholder="Rechercher dans l'historique" aria-label="Rechercher">
+        <button id="btn-csv" type="button">Exporter en CSV</button>
+        <button id="btn-json" type="button">Exporter en JSON</button>
+        <button id="btn-vider" type="button" class="danger">Tout effacer</button>
+      </div>
+
+      <p class="compteur" id="compteur"></p>
+      <ul class="liste" id="liste"></ul>
+      <div class="vide" id="vide" hidden>
+        Aucun QR code pour le moment.<br>
+        <a href="index.html">Aller scanner un QR code</a>
+      </div>
+    </div>
+  </div>
+
+  <script src="config.js"></script>
+  <script src="storage.js"></script>
+  <script>
+    const liste = document.getElementById("liste");
+    const vide = document.getElementById("vide");
+    const compteur = document.getElementById("compteur");
+    const recherche = document.getElementById("recherche");
+    const formConnexion = document.getElementById("connexion");
+    const pagePrincipale = document.getElementById("contenu-page");
+
+    let donnees = [];      // [{id, texte, date, poste}]
+    let derniereSignature = "";
+    let session = null;    // mode en ligne : {access_token, refresh_token, expires_at, email}
+    const CLE_SESSION = "qr-session";
+
+    // =============== Accès en ligne (Supabase) ===============
+    function entetes(avecToken) {
+      const h = { "apikey": CONFIG.SUPABASE_ANON_KEY, "Content-Type": "application/json" };
+      if (avecToken && session) h.Authorization = "Bearer " + session.access_token;
+      return h;
+    }
+
+    function garderSession(r, email) {
+      session = {
+        access_token: r.access_token,
+        refresh_token: r.refresh_token,
+        expires_at: Date.now() + (r.expires_in - 60) * 1000,
+        email: email || (r.user && r.user.email) || (session && session.email) || ""
+      };
+      try { localStorage.setItem(CLE_SESSION, JSON.stringify(session)); } catch (e) {}
+    }
+
+    async function seConnecter(email, mdp) {
+      const rep = await fetch(CONFIG.SUPABASE_URL + "/auth/v1/token?grant_type=password", {
+        method: "POST", headers: entetes(false), body: JSON.stringify({ email: email, password: mdp })
+      });
+      if (!rep.ok) throw new Error("E-mail ou mot de passe incorrect.");
+      garderSession(await rep.json(), email);
+    }
+
+    async function rafraichirSession() {
+      if (!session) return false;
+      if (Date.now() < session.expires_at) return true;
+      try {
+        const rep = await fetch(CONFIG.SUPABASE_URL + "/auth/v1/token?grant_type=refresh_token", {
+          method: "POST", headers: entetes(false), body: JSON.stringify({ refresh_token: session.refresh_token })
+        });
+        if (!rep.ok) return false;
+        garderSession(await rep.json());
+        return true;
+      } catch (e) { return true; } // hors ligne : on réessaiera
+    }
+
+    function deconnecter() {
+      session = null;
+      try { localStorage.removeItem(CLE_SESSION); } catch (e) {}
+      afficherConnexion();
+    }
+
+    async function chargerEnLigne() {
+      if (!(await rafraichirSession())) return deconnecter();
+      try {
+        const rep = await fetch(CONFIG.SUPABASE_URL + "/rest/v1/scans?select=id,contenu,poste,lu_le&order=lu_le.desc&limit=1000",
+          { headers: entetes(true) });
+        if (rep.status === 401) return deconnecter();
+        if (!rep.ok) return;
+        const lignes = await rep.json();
+        donnees = lignes.map(function (l) { return { id: l.id, texte: l.contenu, date: l.lu_le, poste: l.poste || "" }; });
+        majAffichage();
+      } catch (e) { /* hors ligne : on garde l'affichage actuel */ }
+    }
+
+    async function supprimerEnLigne(filtre) {
+      if (!(await rafraichirSession())) return deconnecter();
+      const rep = await fetch(CONFIG.SUPABASE_URL + "/rest/v1/scans?" + filtre, { method: "DELETE", headers: entetes(true) });
+      if (!rep.ok) afficherToast("Suppression impossible");
+      chargerEnLigne();
+    }
+
+    // =============== Affichage ===============
+    function afficherConnexion() {
+      formConnexion.hidden = false;
+      pagePrincipale.hidden = true;
+      document.getElementById("sous-titre").textContent = "Connectez-vous pour consulter l'historique.";
+    }
+
+    function afficherPage() {
+      formConnexion.hidden = true;
+      pagePrincipale.hidden = false;
+      document.getElementById("sous-titre").textContent = "Les QR codes lus, du plus récent au plus ancien.";
+      const barre = document.getElementById("barre-compte");
+      barre.hidden = !CLOUD_ACTIF;
+      if (CLOUD_ACTIF) document.getElementById("connecte-comme").textContent = "Connecté : " + session.email + " · mise à jour automatique";
+    }
+
+    function majAffichage() {
+      const sig = JSON.stringify(donnees);
+      if (sig !== derniereSignature) { derniereSignature = sig; dessiner(); }
+    }
+
+    function dessiner() {
+      const terme = recherche.value.trim().toLowerCase();
+      const filtrees = donnees.filter(function (e) { return e.texte.toLowerCase().includes(terme); });
+
+      liste.textContent = "";
+      vide.hidden = donnees.length > 0;
+      compteur.textContent = donnees.length
+        ? filtrees.length + " sur " + donnees.length + " QR code" + (donnees.length > 1 ? "s" : "")
+        : "";
+
+      filtrees.forEach(function (e) {
+        const li = document.createElement("li");
+        li.className = "entree";
+
+        const t = document.createElement("time");
+        t.dateTime = e.date;
+        t.textContent = formaterDate(e.date);
+        if (e.poste) {
+          const po = document.createElement("span");
+          po.className = "poste";
+          po.textContent = e.poste;
+          t.appendChild(po);
+        }
+
+        const p = document.createElement("pre");
+        p.className = "contenu";
+        p.textContent = e.texte;
+
+        const actions = document.createElement("div");
+        actions.className = "actions";
+
+        const copier = document.createElement("button");
+        copier.type = "button";
+        copier.textContent = "Copier";
+        copier.addEventListener("click", function () { copierTexte(e.texte); });
+        actions.appendChild(copier);
+
+        if (estUrl(e.texte)) {
+          const a = document.createElement("a");
+          a.className = "bouton";
+          a.href = e.texte;
+          a.target = "_blank";
+          a.rel = "noopener noreferrer";
+          a.textContent = "Ouvrir le lien";
+          actions.appendChild(a);
+        }
+
+        const suppr = document.createElement("button");
+        suppr.type = "button";
+        suppr.className = "danger";
+        suppr.textContent = "Supprimer";
+        suppr.addEventListener("click", function () {
+          if (CLOUD_ACTIF) supprimerEnLigne("id=eq." + encodeURIComponent(e.id));
+          else { Historique.supprimer(e.id); chargerLocal(); }
+        });
+        actions.appendChild(suppr);
+
+        li.append(t, p, actions);
+        liste.appendChild(li);
+      });
+    }
+
+    function chargerLocal() {
+      donnees = Historique.lire().map(function (e) { return { id: e.id, texte: e.texte, date: e.date, poste: "" }; });
+      majAffichage();
+    }
+
+    function actualiser() {
+      if (CLOUD_ACTIF) { if (session) chargerEnLigne(); }
+      else chargerLocal();
+    }
+
+    // =============== Exports ===============
+    function telecharger(nom, contenu, type) {
+      const blob = new Blob([contenu], { type: type });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = nom;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+    }
+
+    document.getElementById("btn-json").addEventListener("click", function () {
+      if (!donnees.length) return afficherToast("Historique vide");
+      telecharger("historique-qr.json", JSON.stringify(donnees, null, 2), "application/json");
+    });
+
+    document.getElementById("btn-csv").addEventListener("click", function () {
+      if (!donnees.length) return afficherToast("Historique vide");
+      const echapper = function (s) { return '"' + String(s).replace(/"/g, '""') + '"'; };
+      const lignes = ["date,poste,contenu"].concat(donnees.map(function (e) {
+        return echapper(e.date) + "," + echapper(e.poste || "") + "," + echapper(e.texte);
+      }));
+      telecharger("historique-qr.csv", "\ufeff" + lignes.join("\r\n"), "text/csv;charset=utf-8");
+    });
+
+    document.getElementById("btn-vider").addEventListener("click", function () {
+      if (!donnees.length) return;
+      if (!confirm("Effacer tout l'historique ? Cette action est définitive.")) return;
+      if (CLOUD_ACTIF) supprimerEnLigne("id=not.is.null");
+      else { Historique.vider(); chargerLocal(); }
+    });
+
+    recherche.addEventListener("input", dessiner);
+    window.addEventListener("storage", function () { if (!CLOUD_ACTIF) chargerLocal(); });
+
+    // =============== Démarrage ===============
+    formConnexion.addEventListener("submit", async function (ev) {
+      ev.preventDefault();
+      const err = document.getElementById("erreur");
+      err.textContent = "";
+      try {
+        await seConnecter(document.getElementById("email").value.trim(), document.getElementById("mdp").value);
+        document.getElementById("mdp").value = "";
+        afficherPage();
+        chargerEnLigne();
+      } catch (e) {
+        err.textContent = e.message || "Connexion impossible.";
+      }
+    });
+    document.getElementById("btn-deconnexion").addEventListener("click", deconnecter);
+
+    if (CLOUD_ACTIF) {
+      try { session = JSON.parse(localStorage.getItem(CLE_SESSION)); } catch (e) { session = null; }
+      if (session && session.access_token) { afficherPage(); chargerEnLigne(); }
+      else afficherConnexion();
+      setInterval(function () { if (!document.hidden) actualiser(); }, 4000);
+    } else {
+      afficherPage();
+      chargerLocal();
+    }
+  </script>
+</body>
+</html>

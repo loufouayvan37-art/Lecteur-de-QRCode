@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Lecteur de QR code – Entrée</title>
+  <link rel="stylesheet" href="style.css">
+  <style>
+
+    .page nav{
+      text-align: center;
+    }
+    .page nav a{
+      text-decoration: wavy;
+      font-family: Verdana, Geneva, Tahoma, sans-serif;
+      text-transform: inherit;
+      color: rgb(5, 5, 151);
+      margin: 10px;
+     /* background-color: rgb(6, 6, 238);*/
+      /*height: 15px;
+      width: 25px;*/
+      font-size: 20px;
+
+    }
+    h1{
+      background-color: rgb(5, 5, 151);
+      text-align: center; 
+      color: aliceblue;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif;
+      font-size: 32px;
+      border-radius: 15px;
+      height: 50px;
+
+    }
+    p{
+      text-align: center;
+    }
+    .viseur.ok .cadre { border-color: #2ecc71; }
+    .flash {
+      position: absolute; inset: 0; display: none; flex-direction: column;
+      align-items: center; justify-content: center; gap: 8px; padding: 24px; text-align: center;
+      background: rgba(30, 140, 80, .92); color: #fff;
+    }
+    .viseur.ok .flash { display: flex; }
+    .flash strong { font-size: 1.6rem; }
+    .flash span {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      overflow-wrap: anywhere; max-height: 40%; overflow: hidden;
+    }
+    .statut { margin: 12px 0 0; font-weight: 600; text-align: center; color: var(--encre-douce); }
+    .recents { margin-top: 20px; }
+    .recents h2 { font-size: 1rem; margin: 0 0 8px; }
+    .recents ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
+    .recents li {
+      display: flex; gap: 12px; padding: 8px 12px; background: var(--surface);
+      border: 1px solid var(--trait); border-radius: 8px;
+    }
+    .recents time { color: var(--encre-douce); flex: none; font-variant-numeric: tabular-nums; }
+    .recents .txt { overflow-wrap: anywhere; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: .9rem; }
+    body.plein .page { max-width: 900px; }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <nav>
+      <a href="index.html" aria-current="page">Scanner</a>
+      <a href="historique.html" target="_blank" rel="noopener">Historique</a>
+    </nav>
+
+    <h1>Entrée de l'école</h1>
+    <p class="sous-titre">Présentez le QR code devant la caméra : la lecture et l'enregistrement sont automatiques.</p>
+
+    <div class="viseur attente" id="viseur">
+      <video id="video" playsinline muted></video>
+      <div class="cadre"></div>
+      <div class="flash" id="flash" aria-live="assertive">
+        <strong>QR code enregistré</strong>
+        <span id="flash-texte"></span>
+      </div>
+      <div class="message" id="message">Démarrage de la caméra…</div>
+    </div>
+
+    <p class="statut" id="statut">Prêt à scanner</p>
+    <p class="statut" id="sync" hidden></p>
+
+    <div class="commandes">
+      <button id="btn-camera" type="button">Changer de caméra</button>
+      <button id="btn-son" type="button">Son : activé</button>
+      <button id="btn-plein" type="button">Plein écran</button>
+    </div>
+
+    <section class="recents">
+      <h2>Dernières lectures (<span id="total">0</span> aujourd'hui)</h2>
+      <ul id="recents"></ul>
+    </section>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"></script>
+  <script src="config.js"></script>
+  <script src="storage.js"></script>
+  <script>
+    // ---- Réglages ----
+    const DELAI_MEME_CODE_MS = 8000;   // un même QR code présenté en continu n'est enregistré qu'une fois par 8 s
+    const DELAI_ENTRE_LECTURES_MS = 1200; // pause minimale entre deux lectures (codes différents)
+    const DUREE_CONFIRMATION_MS = 1800;   // durée d'affichage de la confirmation verte
+    const INTERVALLE_ANALYSE_MS = 100;    // ~10 analyses par seconde
+
+    const video = document.getElementById("video");
+    const viseur = document.getElementById("viseur");
+    const message = document.getElementById("message");
+    const flash = document.getElementById("flash-texte");
+    const statut = document.getElementById("statut");
+    const canvas = document.createElement("canvas");
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+
+    let flux = null;
+    let mode = "environment";
+    let actif = false;
+    let sonActif = true;
+    let derniere = { texte: "", t: 0 };
+    let wakeLock = null;
+    let audioCtx = null;
+
+    function etat(classe, texte) {
+      viseur.classList.remove("erreur", "attente");
+      if (classe) viseur.classList.add(classe);
+      if (texte) message.textContent = texte;
+    }
+
+    // ---- Caméra ----
+    async function demarrer() {
+      arreterCamera();
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        etat("erreur", "Caméra indisponible. Ouvrez cette page en HTTPS.");
+        return;
+      }
+      etat("attente", "Démarrage de la caméra…");
+      try {
+        flux = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: { ideal: mode }, width: { ideal: 1280 } },
+          audio: false
+        });
+        // Si la caméra se coupe toute seule, on la relance
+        flux.getTracks().forEach(function (t) {
+          t.addEventListener("ended", function () {
+            if (flux) { etat("attente", "Caméra interrompue, reconnexion…"); setTimeout(demarrer, 2000); }
+          });
+        });
+        video.srcObject = flux;
+        await video.play();
+        etat(null);
+        actif = true;
+        verrouillerEcran();
+        analyser();
+      } catch (e) {
+        etat("erreur", "Accès à la caméra refusé. Autorisez-la dans le navigateur puis rechargez la page.");
+      }
+    }
+
+    function arreterCamera() {
+      actif = false;
+      const f = flux;
+      flux = null;
+      if (f) f.getTracks().forEach(function (t) { t.stop(); });
+    }
+
+    // Empêche la mise en veille de l'écran
+    async function verrouillerEcran() {
+      try {
+        if ("wakeLock" in navigator && !wakeLock) {
+          wakeLock = await navigator.wakeLock.request("screen");
+          wakeLock.addEventListener("release", function () { wakeLock = null; });
+        }
+      } catch (e) { wakeLock = null; }
+    }
+
+    // ---- Analyse en continu ----
+    function analyser() {
+      if (!actif) return;
+      if (video.readyState === video.HAVE_ENOUGH_DATA && video.videoWidth) {
+        const echelle = Math.min(1, 640 / video.videoWidth);
+        canvas.width = Math.round(video.videoWidth * echelle);
+        canvas.height = Math.round(video.videoHeight * echelle);
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        const code = jsQR(img.data, img.width, img.height, { inversionAttempts: "dontInvert" });
+        if (code && code.data) lecture(code.data);
+      }
+      setTimeout(function () { requestAnimationFrame(analyser); }, INTERVALLE_ANALYSE_MS);
+    }
+
+    function lecture(texte) {
+      const maintenant = Date.now();
+      if (maintenant - derniere.t < DELAI_ENTRE_LECTURES_MS) return;
+      if (texte === derniere.texte && maintenant - derniere.t < DELAI_MEME_CODE_MS) {
+        derniere.t = maintenant; // tant que le code reste devant la caméra, on ne le réenregistre pas
+        return;
+      }
+      derniere = { texte: texte, t: maintenant };
+      Historique.ajouter(texte);
+      confirmer(texte);
+      afficherRecents();
+    }
+
+    function confirmer(texte) {
+      flash.textContent = texte.length > 120 ? texte.slice(0, 120) + "…" : texte;
+      viseur.classList.add("ok");
+      statut.textContent = "QR code enregistré";
+      bip();
+      if (navigator.vibrate) navigator.vibrate(80);
+      clearTimeout(confirmer.minuteur);
+      confirmer.minuteur = setTimeout(function () {
+        viseur.classList.remove("ok");
+        statut.textContent = "Prêt à scanner";
+      }, DUREE_CONFIRMATION_MS);
+    }
+
+    // ---- Son ----
+    function bip() {
+      if (!sonActif) return;
+      try {
+        audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+        if (audioCtx.state === "suspended") audioCtx.resume();
+        const o = audioCtx.createOscillator();
+        const g = audioCtx.createGain();
+        o.type = "sine";
+        o.frequency.value = 880;
+        g.gain.setValueAtTime(0.2, audioCtx.currentTime);
+        g.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.25);
+        o.connect(g); g.connect(audioCtx.destination);
+        o.start(); o.stop(audioCtx.currentTime + 0.25);
+      } catch (e) { /* son indisponible */ }
+    }
+
+    // ---- Dernières lectures ----
+    function afficherRecents() {
+      const toutes = Historique.lire();
+      const debutJour = new Date(); debutJour.setHours(0, 0, 0, 0);
+      document.getElementById("total").textContent =
+        toutes.filter(function (e) { return new Date(e.date) >= debutJour; }).length;
+
+      const ul = document.getElementById("recents");
+      ul.textContent = "";
+      toutes.slice(0, 5).forEach(function (e) {
+        const li = document.createElement("li");
+        const t = document.createElement("time");
+        t.dateTime = e.date;
+        t.textContent = new Date(e.date).toLocaleTimeString("fr-FR");
+        const s = document.createElement("span");
+        s.className = "txt";
+        s.textContent = e.texte.length > 80 ? e.texte.slice(0, 80) + "…" : e.texte;
+        li.append(t, s);
+        ul.appendChild(li);
+      });
+    }
+
+    // ---- Boutons ----
+    document.getElementById("btn-camera").addEventListener("click", function () {
+      mode = mode === "environment" ? "user" : "environment";
+      demarrer();
+    });
+    document.getElementById("btn-son").addEventListener("click", function (ev) {
+      sonActif = !sonActif;
+      ev.target.textContent = "Son : " + (sonActif ? "activé" : "désactivé");
+      if (sonActif) bip(); // ce clic débloque aussi l'audio du navigateur
+    });
+    document.getElementById("btn-plein").addEventListener("click", function () {
+      if (document.fullscreenElement) document.exitFullscreen();
+      else if (document.documentElement.requestFullscreen) document.documentElement.requestFullscreen();
+    });
+
+    document.addEventListener("visibilitychange", function () {
+      if (document.hidden) { arreterCamera(); }
+      else { demarrer(); }
+    });
+    window.addEventListener("storage", afficherRecents);
+
+    function majSync() {
+      const el = document.getElementById("sync");
+      if (!CLOUD_ACTIF) return;
+      const n = Historique.enAttente();
+      el.hidden = false;
+      el.textContent = n ? "Envoi en ligne : " + n + " lecture(s) en attente" : "Envoi en ligne : à jour";
+    }
+    setInterval(majSync, 2000);
+    majSync();
+
+    afficherRecents();
+    demarrer();
+  </script>
+</body>
+</html>
